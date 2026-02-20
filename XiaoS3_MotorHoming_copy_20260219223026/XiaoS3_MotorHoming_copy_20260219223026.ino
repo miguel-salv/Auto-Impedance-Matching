@@ -2,102 +2,125 @@
 #include <TMCStepper.h>
 
 // --- PIN CONFIGURATION ---
-const int STEP_PIN = D0;
-const int DIR_PIN  = D1;
-const int RX_PIN   = D7; // Xiao RX -> TMC TX
-const int TX_PIN   = D6; // Xiao TX -> TMC RX
+const int STEP_PIN_1 = D0;
+const int DIR_PIN_1  = D1;
+const int STEP_PIN_2 = D8;
+const int DIR_PIN_2  = D9;
+const int RX_PIN     = D7; 
+const int TX_PIN     = D6; 
 
 // --- TMC2209 UART CONFIGURATION ---
-#define SERIAL_PORT Serial1       // Hardware Serial 1 on ESP32-S3
-#define R_SENSE     0.11f         // Standard sense resistor on most TMC2209 modules
-#define DRV_ADDRESS 0b00          // Default UART address for the driver
+#define SERIAL_PORT Serial1       
+#define R_SENSE     0.11f         
+#define DRV_ADDRESS_1 0b00 
+#define DRV_ADDRESS_2 0b01 
 
-TMC2209Stepper driver(&SERIAL_PORT, R_SENSE, DRV_ADDRESS);
+TMC2209Stepper driver1(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_1);
+TMC2209Stepper driver2(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_2);
 
-// --- MOTION & STALLGUARD SETTINGS ---
-#define STALL_VALUE 100          // [0..255] Sensitivity. Lower = less sensitive. Needs tuning!
-#define STEP_DELAY  200           // Microseconds between steps. Controls speed.
+// --- SETTINGS ---
+#define STALL_VALUE 100           
+#define STEP_DELAY  200           
+#define POLL_INTERVAL 50          
 
-bool currentDirection = true;     // Tracks the current motor direction
+bool dir1 = true;
+bool dir2 = true;
+bool sequenceComplete = false;
 
-unsigned long lastPollTime = 0;
-const int POLL_INTERVAL = 10; // Read SG_RESULT every 50ms
 void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000); // Wait up to 3 seconds for serial monitor
+  Serial.begin(500000);
+  while (!Serial && millis() < 3000); 
   
-  Serial.println("Initializing TMC2209 Sensorless Bouncing...");
+  pinMode(STEP_PIN_1, OUTPUT); pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(STEP_PIN_2, OUTPUT); pinMode(DIR_PIN_2, OUTPUT);
+  
+  digitalWrite(DIR_PIN_1, dir1); 
+  digitalWrite(DIR_PIN_2, dir2);
 
-  // 1. Configure Hardware Pins
-  pinMode(STEP_PIN, OUTPUT);
-  pinMode(DIR_PIN, OUTPUT);
-  digitalWrite(DIR_PIN, currentDirection);
-  
-  // 2. Initialize Hardware UART for the Xiao ESP32-S3
+  // Initialize UART at 500k as per your successful test
   SERIAL_PORT.begin(500000, SERIAL_8N1, RX_PIN, TX_PIN);
-  
-  // 3. Configure TMC2209
-  driver.begin();
-  driver.toff(5);                 // Enable driver in software
-  driver.rms_current(800);        // Set motor RMS current in mA
-  driver.microsteps(16);          // Set microsteps to 1/16
-  
-  // 4. Configure StallGuard4
-  driver.en_spreadCycle(false);   // MUST be false. StallGuard4 only works in StealthChop.
-  driver.pwm_autoscale(true);     // Required for StealthChop to work properly.
-  
-  // TCOOLTHRS defines the lower velocity threshold for StallGuard. 
-  // 0xFFFFF is a safe catch-all to enable it at almost all speeds for testing.
-  driver.TCOOLTHRS(0xFFFFF);    
-  
-  // Set the stall sensitivity threshold
-  driver.SGTHRS(STALL_VALUE);
+  delay(500);
 
-  uint8_t conn_result = driver.test_connection();
-  if (conn_result == 0) {
-    Serial.println("UART connection successful!");
-  } else {
-    Serial.print("UART connection FAILED. Error code: ");
-    Serial.println(conn_result);
-    while(1); // Halt the program so you can fix the wiring
-  }
-  
-  Serial.println("Setup Complete. Starting motor.");
+  // Configure Driver 1
+  driver1.begin();
+  driver1.toff(5);                 
+  driver1.rms_current(800);        
+  driver1.microsteps(16);          
+  driver1.en_spreadCycle(false);   
+  driver1.pwm_autoscale(true);     
+  driver1.TCOOLTHRS(0xFFFFF);    
+  driver1.SGTHRS(STALL_VALUE);
+
+  // Configure Driver 2
+  driver2.begin();
+  driver2.toff(5);                 
+  driver2.rms_current(800);        
+  driver2.microsteps(16);          
+  driver2.en_spreadCycle(false);   
+  driver2.pwm_autoscale(true);     
+  driver2.TCOOLTHRS(0xFFFFF);    
+  driver2.SGTHRS(STALL_VALUE);
+
+  Serial.println("Setup Complete. Starting Sequence...");
 }
 
-
-
 void loop() {
-  // 1. Uninterrupted Stepping
-  digitalWrite(STEP_PIN, HIGH);
-  delayMicroseconds(STEP_DELAY / 2);
-  digitalWrite(STEP_PIN, LOW);
-  delayMicroseconds(STEP_DELAY / 2);
 
-  // 2. Timed UART Polling
-  if (millis() - lastPollTime >= POLL_INTERVAL) {
-    lastPollTime = millis();
+  Serial.println("Homing Motor 1...");
+  runUntilStall(driver1, STEP_PIN_1, DIR_PIN_1, dir1,270);
+  
+  delay(1000); // Small gap between motors for clarity
+
+  Serial.println("Homing Motor 2...");
+  runUntilStall(driver2, STEP_PIN_2, DIR_PIN_2, dir2,250);
+
+  Serial.println("Sequence Complete.");
+
+}
+
+// Dedicated function to run a motor until stall, then bounce
+void runUntilStall(TMC2209Stepper &driver, int stepPin, int dirPin, bool &currentDir, int threshold) {
+  unsigned long lastPoll = 0;
+  bool stalled = false;
+  //get the motor started
+  for(int i = 0; i < 50; i++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(STEP_DELAY / 2);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(STEP_DELAY / 2);
+  }
+  while (!stalled) {
     
-    uint16_t sg_result = driver.SG_RESULT();
-
-    // Only trigger if we actually hit 0 (a hard stall)
-    if (sg_result < 250) {
-      Serial.println("Stall detected! Bouncing back...");
-      delay(50);
-      
-      currentDirection = !currentDirection;
-      digitalWrite(DIR_PIN, currentDirection);
-      
-      // Force step away from the wall
-      for(int i = 0; i < 50; i++) {
-        digitalWrite(STEP_PIN, HIGH);
-        delayMicroseconds(STEP_DELAY / 2);
-        digitalWrite(STEP_PIN, LOW);
-        delayMicroseconds(STEP_DELAY / 2);
+    // 1. Physical Step
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(STEP_DELAY / 2);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(STEP_DELAY / 2);
+    //Serial.println(driver.SG_RESULT() );
+    // 2. Check StallGuard every 10ms
+    if (millis() - lastPoll >= POLL_INTERVAL) {
+      int pollres = driver.SG_RESULT();
+      Serial.println(pollres);
+      lastPoll = millis();
+      if (pollres < threshold) { 
+        
+        stalled = true;
       }
-      
-      // Reset the timer so we don't immediately poll again
-      lastPollTime = millis(); 
     }
+  }
+
+  // 3. Bounce Logic (Inherited from your original script)
+  Serial.println("Stall detected! Bouncing...");
+  delay(50); // Resonance settle [cite: 62]
+  
+  currentDir = !currentDir;
+  digitalWrite(dirPin, currentDir);
+  
+  // Force 50 steps away from wall [cite: 68]
+  for(int i = 0; i < 50; i++) {
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(STEP_DELAY / 2);
+    digitalWrite(stepPin, LOW);
+    delayMicroseconds(STEP_DELAY / 2);
   }
 }
