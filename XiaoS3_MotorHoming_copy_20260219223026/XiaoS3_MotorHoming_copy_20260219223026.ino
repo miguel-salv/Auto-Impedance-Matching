@@ -38,7 +38,7 @@ TMC2209Stepper driver2(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_2);
 #define PI 3.14159f
 
 #define MAX_STEPSIZE PI/36
-#define MIN_STEPSIZE PI/90
+#define MIN_STEPSIZE PI/180
 // --- POSITION TRACKING ---
 float motor1_pos = 2 * PI;
 float motor2_pos = 2 * PI;
@@ -177,7 +177,7 @@ void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gra
 
   float actualTravel = turnByRad(driver, stepPin, dirPin,commandedStepSize, motor_pos);
 
-  delay(250);
+  delay(25);
 
   if (actualTravel != 0.0f) {
     gradient = (initialCost - sampVSWR(FWD_PIN, REV_PIN)) / actualTravel;
@@ -232,7 +232,7 @@ float sampVSWR(int fwd, int rev){
     // Read the factory-calibrated voltage in mV
     sum_fwd += analogReadMilliVolts(fwd);
     sum_rev += analogReadMilliVolts(rev);
-    delayMicroseconds(30);
+    delayMicroseconds(15);
   }
   // Calculate Average Millivolts
   float averageMv_fwd = sum_fwd / samp_num;
