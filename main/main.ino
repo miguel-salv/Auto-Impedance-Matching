@@ -1,244 +1,327 @@
-#include <TeensyStep.h>
+#include <Arduino.h>
+#include <TMCStepper.h>
 
-/**
- * This code has been developed as part of the CMU Hackerfab Automatic 
- * Impedance Matcher project. It controls two servos (tx_servo and
- * ant_servo) based on the position of two potentiometers in MANUAL mode, or
- * implements automatic SWR tuning using gradient descent in AUTOMATED mode.
- *
- * @author Miguel Salvacion, William Gao, Aiden Magee
- * CMU Hackerfab
- */
+// --- PIN CONFIGURATION ---
+const int STEP_PIN_1 = 2;
+const int DIR_PIN_1 = 3;
+const int STEP_PIN_2 = 9;
+const int DIR_PIN_2 = 10;
+const int RX_PIN = 0;   // Hardware RX for Serial1 on Teensy 4.0
+const int TX_PIN = 1;   // Hardware TX for Serial1 on Teensy 4.0
+const int FWD_PIN = 25;
+const int REV_PIN = 24;
+const int TRANSMIT_PIN = 31;
 
-// Define pins
-const int tx_dialPin = 39;                // Potentiometer for tx_stepper
-const int ant_dialPin = 38;               // Potentiometer for ant_stepper
-const int switchPin = 32;                 // Switch to toggle between states
-const int tx_stepPin = 0;                 // STEP pin for TX
-const int tx_dirPin = 1;                  // DIR pin for TX
-const int ant_stepPin = 2;                // STEP pin for ANT
-const int ant_dirPin = 3;                 // DIR pin for ANT
-const int tx_enablePin = 4;               // ENABLE for TX
-const int ant_enablePin = 5;              // ENABLE for ANT
-const int vswrPin = A0;                   // Forward voltage pin
-const int vswrRevPin = A1;                // Reverse voltage pin
+// --- TMC2209 UART CONFIGURATION ---
+#define SERIAL_PORT Serial1
+#define R_SENSE 0.11f
+#define DRV_ADDRESS_1 0b00
+#define DRV_ADDRESS_2 0b01
 
-// Stepper motor config
-const float STEPS_PER_REV = 200.0;
-const float STEPS_PER_DEGREE = STEPS_PER_REV / 360.0;
-const float MAX_SPEED_STEPS = 2000.0;     // steps/s 
-const float ACCEL_STEPS = 5000.0;         // steps/s^2
+TMC2209Stepper driver1(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_1);
+TMC2209Stepper driver2(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_2);
 
-// SWR configuration constants
-const int AVG_SAMPLES = 20;               // Number of samples to average
-const float DIVIDER_RATIO = 3.2;          // Voltage divider ratio (R1 + R2) / R2
-const float V_REF = 3.3;                  // Teensy ADC reference voltage
-const float OPAMP_OFFSET = 0.03;          // Op-amp offset calibration
+// --- SETTINGS ---
+#define STALL_VALUE 140
+#define STEP_DELAY 200
+#define POLL_INTERVAL 10
+#define STREAM_PLOT_DATA 1
 
-// Auto-tuning configuration
-const float TARGET_SWR = 1.2;             // Target SWR threshold
-const int SERVO_STEP = 2;                 // Degrees to move
-const unsigned long TUNE_INTERVAL = 75;   // Auto-tune interval in ms
+//--- MECH SPECS ---
+#define STEPS_PER_RAD 63.66197f
+#define MICROSTEPS_PER_STEP 32
+#define MAX_ROT 3.14159f
+#define GRAD_SCALE 0.025f
 
-// Create stepper objects
-Stepper tx_stepper(tx_stepPin, tx_dirPin);
-Stepper ant_stepper(ant_stepPin, ant_dirPin);
-StepControl<> stepController;
+#define GRAD_DEADBAND .001f
 
-// Define states
-enum State { AUTOMATED, MANUAL };
-State state = MANUAL;                     // Start in MANUAL mode
+#define MAX_STEPSIZE PI/36
+#define MIN_STEPSIZE PI/700
 
-// Auto-tuning variables
-int current_tx_angle = 90;                // Current servo position
-float current_swr = 99.9;                 // Current SWR reading
-int search_direction = SERVO_STEP;        // Current search direction
-bool first_auto_run = true;               // Flag for initial reading
-unsigned long last_tune_time = 0;         // Time for timing control
+// --- POSITION TRACKING ---
+float motor1_pos = 2 * PI;
+float motor2_pos = 2 * PI;
 
-// Forward declarations
-float measureSWR();
-float readAverage(int pin);
-long angleToSteps(float angle);
-float stepsToAngle(long steps);
+bool dir1 = true;
+bool dir2 = true;
 
-/* Setup steppers and ADC */
+float dM1 = 0.1;
+float dM2 = 0.1;
+
+float SWR;
+
+const float samp_num = 300.0;
+
+bool atMatch = false;
+
+// Custom Teensy replacement for ESP32's analogReadMilliVolts
+float analogReadMilliVolts(int pin) {
+  int rawValue = analogRead(pin);
+  // Convert 12-bit reading (0-4095) to millivolts using a 3.3V (3300mV) reference
+  return (rawValue / 4095.0) * 3300.0;
+}
+
+float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, float &motor_pos, bool ignoreLimits = false) {
+  if (rads == 0.0f) {
+    return 0.0f;
+  }
+
+  bool isNegativeDir = (rads < 0.0f);
+  digitalWrite(dirPin, isNegativeDir);
+
+  float abs_rads = isNegativeDir ? -rads : rads;
+  int total_steps = radToSteps(abs_rads);
+
+  float step_increment = stepsToRad(1);
+  float position_change = isNegativeDir ? -step_increment : step_increment;
+
+  int steps_taken = 0;
+  for (int i = 0; i < total_steps; i++) {
+    if (!ignoreLimits) {
+      bool hittingUpperLimit = (motor_pos >= MAX_ROT && position_change > 0.0f);
+      bool hittingLowerLimit = (motor_pos <= 0.0f && position_change < 0.0f);
+      if (hittingUpperLimit || hittingLowerLimit) {
+        Serial.println("MOTOR LIMIT REACHED");
+        break;
+      }
+    }
+
+    takeStep(stepPin);
+    motor_pos += position_change;
+    steps_taken++;
+  }
+
+  return steps_taken * position_change;
+}
+
 void setup() {
-  Serial.begin(115200);
+  // Maximize Teensy ADC resolution for accurate readings
+  analogReadResolution(12);
+  
+  Serial.begin(500000);
+  while (!Serial && millis() < 3000)
+    ;
 
-  // Enable motor drivers
-  pinMode(tx_enablePin, OUTPUT);
-  pinMode(ant_enablePin, OUTPUT);
-  digitalWrite(tx_enablePin, LOW);
-  digitalWrite(ant_enablePin, LOW);
+  pinMode(STEP_PIN_1, OUTPUT);
+  pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(STEP_PIN_2, OUTPUT);
+  pinMode(DIR_PIN_2, OUTPUT);
 
-  tx_stepper.setMaxSpeed(MAX_SPEED_STEPS);
-  tx_stepper.setAcceleration(ACCEL_STEPS);
-  tx_stepper.setPosition(angleToSteps(90)); // Start at 90°
-  ant_stepper.setMaxSpeed(MAX_SPEED_STEPS);
-  ant_stepper.setAcceleration(ACCEL_STEPS);
-  ant_stepper.setPosition(angleToSteps(90));
+  digitalWrite(DIR_PIN_1, dir1);
+  digitalWrite(DIR_PIN_2, dir2);
+  digitalWrite(TRANSMIT_PIN, HIGH);
 
-  if (!stepController.isOk()) {
-    Serial.println("StepController init failed");
-  }
+  // Initialize hardware serial using Teensy's standard method
+  SERIAL_PORT.begin(500000, SERIAL_8N1);
+  delay(500);
 
-  // Configure ADC resolution for Teensy
-  analogReadResolution(12); // 4095 max value
+  // Configure Driver 1
+  // driver1.begin();
+  // driver1.toff(5);
+  // driver1.rms_current(800);
+  // driver1.microsteps(16);
+  // driver1.en_spreadCycle(false);
+  // driver1.pwm_autoscale(true);
+  // driver1.TCOOLTHRS(0xFFFFF);
+  // driver1.SGTHRS(STALL_VALUE);
 
-  pinMode(switchPin, INPUT_PULLUP);
-  pinMode(vswrPin, INPUT);
-  pinMode(vswrRevPin, INPUT);
+  // // Configure Driver 2
+  // driver2.begin();
+  // driver2.toff(5);
+  // driver2.rms_current(800);
+  // driver2.microsteps(16);
+  // driver2.en_spreadCycle(false);
+  // driver2.pwm_autoscale(true);
+  // driver2.TCOOLTHRS(0xFFFFF);
+  // driver2.SGTHRS(STALL_VALUE);
+  
+  // testUART(driver1, 1);
+  // testUART(driver2, 2);
 
-  delay(100);
-  Serial.println("Impedance Matching Ready");
+  Serial.println("Starting Homing Sequence...");
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, -1 * PI, motor1_pos, true);
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, -1 * PI, motor2_pos, true);
+
+  motor1_pos = 0;
+  motor2_pos = 0;
+  Serial.println("Finished Homing Sequence...");
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, PI/2, motor1_pos, true);
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, PI/2, motor2_pos, true);
 }
 
-/* Check what state we are in */
 void loop() {
-  // Parse switch state
-  State new_state = digitalRead(switchPin) == HIGH ? MANUAL : AUTOMATED;
-  
-  // Reset state when switching to AUTOMATED
-  if (new_state == AUTOMATED && state == MANUAL) {
-    first_auto_run = true;
-    current_tx_angle = (int)round(stepsToAngle(tx_stepper.getPosition()));
-  }
-
-  state = new_state;
-  if (state == AUTOMATED) {
-    controlServosAutomated();
+  if (!atMatch) {
+    calcGradAndStep(driver1, STEP_PIN_1, DIR_PIN_1, dM1, motor1_pos);
+    //Serial.print("motor1: ");
+    //Serial.print(motor1_pos);
+    calcGradAndStep(driver2, STEP_PIN_2, DIR_PIN_2, dM2, motor2_pos);
+    //Serial.print(" motor2: ");
+    //Serial.print(motor2_pos);
   } else {
-    controlServosManual();
+    sampVSWR(FWD_PIN, REV_PIN);
+    Serial.println("At match");
   }
 
-  delay(10); // Keep loop responsive
+  // Serial.print(" Voltage Read REV:");
+  // Serial.println(readPinVoltage(REV_PIN));
+  // Serial.print(" Voltage Read FWD:");
+  // Serial.println(readPinVoltage(FWD_PIN));
 }
 
-/* Gradient descent algorithm */
-void controlServosAutomated() {
-  unsigned long current_time = millis();
-  
-  // Only run at interval
-  if (current_time - last_tune_time < TUNE_INTERVAL) {
-    return;
-  }
-  last_tune_time = current_time;
-  
-  // Initial reading on first run
-  if (first_auto_run) {
-    current_swr = measureSWR();
-    first_auto_run = false;
-    search_direction = SERVO_STEP;
-    Serial.print("AUTO-TUNE STARTED | SWR: ");
-    Serial.print(current_swr, 2);
-    Serial.print(" | Pos: ");
-    Serial.println(current_tx_angle);
-    return;
-  }
-  
-  // Check stopping conditions
-  if (current_swr <= TARGET_SWR) {
-    Serial.print("TARGET REACHED | SWR: ");
-    Serial.print(current_swr, 2);
-    Serial.print(" | Pos: ");
-    Serial.println(current_tx_angle);
-    return;
-  }
-  
-  if (current_tx_angle <= 0 || current_tx_angle >= 180) {
-    Serial.print("LIMIT REACHED | Pos: ");
-    Serial.print(current_tx_angle);
-    Serial.print(" | SWR: ");
-    Serial.println(current_swr, 2);
-    return;
-  }
-  
-  // Gradient descent: try a step and evaluate
-  float previous_swr = current_swr;
-  
-  // Try moving in current direction
-  int new_angle = constrain(current_tx_angle + search_direction, 0, 180);
 
-  // Move stepper and wait until done (blocking)
-  tx_stepper.setTargetAbs(angleToSteps(new_angle));
-  stepController.move(tx_stepper);
-  delay(20); // Settling time
+void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gradient, float &motor_pos) {
 
-  // Measure new SWR
-  current_swr = measureSWR();
-  current_tx_angle = new_angle;
+  // if (gradient > -GRAD_DEADBAND && gradient < GRAD_DEADBAND) {
+  //   return;
+  // }
+
+  float initialCost = sampVSWR(FWD_PIN, REV_PIN);
+  //Serial.println(gradient);
   
-  // If SWR got worse, reverse direction
-  if (current_swr >= previous_swr) {
-    search_direction = -search_direction;
+  float commandedStepSize = gradient * GRAD_SCALE;
+
+  commandedStepSize = clampMagnitude(commandedStepSize, MIN_STEPSIZE, MAX_STEPSIZE);
+  bool hittingUpperLimit = (motor_pos >= MAX_ROT-MIN_STEPSIZE) ;
+  bool hittingLowerLimit = (motor_pos <= MIN_STEPSIZE);
+  if(hittingUpperLimit){
+    commandedStepSize = -MIN_STEPSIZE;
   }
-  
-  Serial.print(current_swr < previous_swr ? "^ " : "⌄ ");
-  Serial.print("SWR:");
-  Serial.print(current_swr, 2);
-  Serial.print(" | Pos:");
-  Serial.print(current_tx_angle);
-  Serial.print(" | Dir:");
-  Serial.println(search_direction);
+  if(hittingLowerLimit){
+    commandedStepSize = MIN_STEPSIZE;
+  }
+
+
+  float actualTravel = turnByRad(driver, stepPin, dirPin,commandedStepSize, motor_pos);
+
+  delay(5);
+  if (actualTravel != 0.0f) {
+    gradient = (initialCost - sampVSWR(FWD_PIN, REV_PIN)) / actualTravel;
+  }
 }
 
-/* Simple manual control */
-void controlServosManual() {
-  int tx_angle = map(analogRead(tx_dialPin), 0, 4095, 0, 180);
-  int ant_angle = map(analogRead(ant_dialPin), 0, 4095, 0, 180);
+float clampMagnitude(float value, float minMagnitude, float maxMagnitude) {
+    float magnitude = (value < 0.0f) ? -value : value;
+    float sign = (value < 0.0f) ? -1.0f : 1.0f;
+    if (magnitude > maxMagnitude) {
+        return maxMagnitude * sign;
+    }
 
-  tx_stepper.setTargetAbs(angleToSteps(tx_angle));
-  ant_stepper.setTargetAbs(angleToSteps(ant_angle));
-  if (!stepController.isRunning()) {
-    stepController.moveAsync(tx_stepper, ant_stepper);
+    if (magnitude < minMagnitude) {
+        return minMagnitude * sign;
+    }
+
+    return value;
+}
+
+float calcSWR() {
+  float err1 = motor1_pos - 2 * PI;
+  float err2 = motor2_pos - (PI / 2.0f);
+  return (err1 * err1) + (err2 * err2);
+}
+
+float stepsToRad(int steps) {
+  return steps / (STEPS_PER_RAD * MICROSTEPS_PER_STEP);
+}
+
+int radToSteps(float rads) {
+  return round_up(rads * (STEPS_PER_RAD * MICROSTEPS_PER_STEP));
+}
+
+void testUART(TMC2209Stepper &driver, int drivNum) {
+  uint8_t conn_result = driver.test_connection();
+  if (conn_result == 0) {
+    Serial.print("UART connection successful: ");
+    Serial.println(drivNum);
+  } else {
+    Serial.print("UART connection FAILED. Error code: ");
+    Serial.println(conn_result);
+    while (1)
+      ;  // Halt the program so you can fix the wiring
+  }
+}
+
+float sampVSWR(int fwd, int rev){
+  float sum_fwd = 0.0;
+  float sum_rev = 0.0;
+  for (int i = 0; i < samp_num; i++) {
+    // Read the voltage in mV using custom Teensy function
+    sum_fwd += analogReadMilliVolts(fwd);
+    sum_rev += analogReadMilliVolts(rev);
+    delayMicroseconds(15);
+  }
+  // Calculate Average Millivolts
+  float averageMv_fwd = sum_fwd / samp_num;
+  float averageMv_rev = sum_rev / samp_num;
+  // Convert mV to Volts
+  float vswr = (averageMv_fwd + averageMv_rev) / ((averageMv_fwd - averageMv_rev));
+  float loss = (vswr - 1.0f);
+  loss = loss * loss;
+
+  if (vswr > 1.4f) atMatch = false;
+  if (vswr < 1.2f) atMatch = true;
+
+#if STREAM_PLOT_DATA
+  // Machine-readable stream for host plotting: tag,millis,vswr,motor1_pos,motor2_pos,at_match
+  Serial.print("VSWR_CSV,");
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(vswr, 6);
+  Serial.print(",");
+  Serial.print(motor1_pos, 6);
+  Serial.print(",");
+  Serial.print(motor2_pos, 6);
+  Serial.print(",");
+  Serial.println(atMatch ? 1 : 0);
+#else
+  Serial.print(" VSWR:");
+  Serial.print(vswr);
+  Serial.print(" LOSS:");
+  Serial.println(loss);
+#endif
+
+  return loss; // square the loss
+}
+
+void takeStep(int stepPin) {
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(STEP_DELAY / 2);
+  digitalWrite(stepPin, LOW);
+  delayMicroseconds(STEP_DELAY / 2);
+}
+
+float readPinVoltage(int sensorPin) {
+  // Guard clause to prevent division by zero
+  if (samp_num <= 0) {
+    return 0.0f; 
   }
 
-  Serial.print("MANUAL | TX:");
-  Serial.print(tx_angle);
-  Serial.print("° | ANT:");
-  Serial.print(ant_angle);
-  Serial.println("°");
-}
+  float sum = 0.0;
+  // Teensy 4.1 default ADC resolution is 10-bit (0-1023) at 3.3V
+  const float mvPerStep = 3300.0f / 1023.0f;
 
-/* Helper functions */
-
-// Map 0–180 to step position
-long angleToSteps(float angle) {
-  return (long)round(angle * STEPS_PER_DEGREE);
-}
-float stepsToAngle(long steps) {
-  return (float)steps / STEPS_PER_DEGREE;
-}
-
-// Smooth out noise with averaging
-float readAverage(int pin) {
-  long sum = 0;
-  for (int i = 0; i < AVG_SAMPLES; i++) {
-    sum += analogRead(pin);
-    delayMicroseconds(10); // Pause between reads for ADC stability
-  }
-  return (float)sum / AVG_SAMPLES;
-}
-
-// Measure SWR using forward and reverse voltage readings
-float measureSWR() {
-  // Read and convert to real sensor voltage
-  const float ADC_TO_VOLTS = V_REF * DIVIDER_RATIO / 4095.0;
-  
-  float v_fwd = readAverage(vswrPin) * ADC_TO_VOLTS - OPAMP_OFFSET;
-  float v_rev = readAverage(vswrRevPin) * ADC_TO_VOLTS - OPAMP_OFFSET;
-  
-  // Clamp negative voltages
-  v_fwd = max(0.0f, v_fwd);
-  v_rev = max(0.0f, v_rev);
-  
-  // Calculate SWR: (1 + gamma) / (1 - gamma)
-  // gamma = V_rev / V_fwd
-  if (v_fwd <= 0.5 || v_rev >= v_fwd) {
-    return 99.9; // TX off or infinite SWR
+  for (int i = 0; i < samp_num; i++) {
+    // Read the voltage in mV using custom Teensy function
+    sum += analogRead(sensorPin) * mvPerStep;
+    delayMicroseconds(30);
   }
   
-  float gamma = v_rev / v_fwd;
-  return (1.0 + gamma) / (1.0 - gamma);
+  // Calculate Average Millivolts
+  float averageMv = sum / samp_num;
+  
+  // Convert mV to Volts
+  float voltage = averageMv / 1000.0;
+  
+  return voltage;
+}
+int round_up(float value) {
+  int truncated = static_cast<int>(value);
+
+  // Casting to int truncates towards zero.
+  // If the original float is strictly greater than the truncated int,
+  // it had a positive fractional component that requires bumping up.
+  if (value > truncated) {
+    return truncated + 1;
+  }
+
+  return truncated;
 }
