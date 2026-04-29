@@ -67,8 +67,8 @@ def main():
     line_motor1, = ax_motor.plot([], [], label="Motor 1 Pos (rad)")
     line_motor2, = ax_motor.plot([], [], label="Motor 2 Pos (rad)")
 
-    ax_vswr.set_ylabel("VSWR (Window)")
-    ax_vswr_full.set_ylabel("VSWR (Run)")
+    ax_vswr.set_ylabel("VSWR")
+    ax_vswr_full.set_ylabel("VSWR")
     ax_motor.set_ylabel("Motor Pos (rad)")
     ax_motor.set_xlabel("Time (s)")
     ax_vswr.grid(True, alpha=0.3)
@@ -80,7 +80,11 @@ def main():
     status_text = fig.text(0.02, 0.98, "Match: unknown", ha="left", va="top")
     plt.show(block=False)
 
+    PLOT_INTERVAL = 0.1  # redraw at 10 Hz regardless of data rate
+
     t0_host = None
+    last_plot_time = 0.0
+    at_match = False
     csv_exists = os.path.exists(args.csv)
     with open(args.csv, "a", newline="") as csv_file:
         writer = csv.writer(csv_file)
@@ -89,6 +93,7 @@ def main():
 
         try:
             while True:
+                # --- drain all waiting serial lines before redrawing ---
                 try:
                     raw = ser.readline().decode("utf-8", errors="ignore").strip()
                 except serial.SerialException as exc:
@@ -136,24 +141,27 @@ def main():
                     motor1_vals.popleft()
                     motor2_vals.popleft()
 
-                line_vswr.set_data(times, vswr_vals)
-                line_vswr_full.set_data(all_times, all_vswr_vals)
-                line_motor1.set_data(times, motor1_vals)
-                line_motor2.set_data(times, motor2_vals)
-
-                status_text.set_text(f"Match: {'YES' if at_match else 'NO'}")
-
                 writer.writerow([host_now, t_ms, vswr, motor1_pos, motor2_pos, int(at_match)])
                 csv_file.flush()
 
-                ax_vswr.relim()
-                ax_vswr.autoscale_view()
-                ax_vswr_full.relim()
-                ax_vswr_full.autoscale_view()
-                ax_motor.relim()
-                ax_motor.autoscale_view()
-                fig.canvas.draw_idle()
-                fig.canvas.flush_events()
+                # --- redraw only at PLOT_INTERVAL, not on every sample ---
+                if host_now - last_plot_time >= PLOT_INTERVAL:
+                    last_plot_time = host_now
+
+                    line_vswr.set_data(times, vswr_vals)
+                    line_vswr_full.set_data(all_times, all_vswr_vals)
+                    line_motor1.set_data(times, motor1_vals)
+                    line_motor2.set_data(times, motor2_vals)
+                    status_text.set_text(f"Match: {'YES' if at_match else 'NO'}")
+
+                    ax_vswr.relim()
+                    ax_vswr.autoscale_view()
+                    ax_vswr_full.relim()
+                    ax_vswr_full.autoscale_view()
+                    ax_motor.relim()
+                    ax_motor.autoscale_view()
+                    fig.canvas.draw_idle()
+                    fig.canvas.flush_events()
         except KeyboardInterrupt:
             print("\nStopping.")
         finally:
