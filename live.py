@@ -9,14 +9,12 @@ import matplotlib.pyplot as plt
 import serial
 from serial.tools import list_ports
 
-
 DEFAULT_BAUD = 500000
 DEFAULT_WINDOW_SECONDS = 20.0
 DEFAULT_CSV_PATH = os.path.join("data", "csv", "latest.csv")
 
-# Prevent MacOS matplotlib windows from stealing focus on redraw.
+# Prevent MacOS matplotlib windows from stealing focus on redraw
 plt.rcParams["figure.raise_window"] = False
-
 
 def get_default_port():
     ports = [p.device for p in list_ports.comports()]

@@ -2,20 +2,14 @@
 """
 Plot a saved VSWR telemetry CSV file.
 
-Expected format (same as live.py / test3.csv):
+Expected format:
 
   host_time_s,device_millis,vswr,forward_v,reverse_v,motor1_pos_rad,motor2_pos_rad,at_match
 
-Motor columns may be the literal "nan" when unknown.
-
-Rows must have exactly eight fields; non-finite time or VSWR are skipped.
-VSWR must lie in [-50, 50] (rows outside that range are dropped as bad sensor/glitches).
+VSWR outside [-50, 50] are dropped.
 
 For large files, data is binned for display (mean + VSWR min/max ribbon) so plots
 stay readable without manual downsampling.
-
-Input paths: if the file is not found in the current directory, a bare filename is
-looked up under data/csv/ (e.g. csvplot.py test1.csv → data/csv/test1.csv).
 """
 from __future__ import annotations
 
@@ -32,7 +26,7 @@ import numpy as np
 DATA_CSV_DIR = os.path.join("data", "csv")
 DATA_HTML_DIR = os.path.join("data", "html")
 
-# Drop VSWR outliers (garbage spikes); keep typical SWR readouts and legacy negatives.
+# Drop VSWR outliers (garbage spikes)
 VSWR_ABS_MAX = 50.0
 
 
