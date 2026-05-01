@@ -5,3 +5,4 @@
 .vscode/ipch
 __pycache__/
 data/
+**/.DS_Store

@@ -6,10 +6,10 @@ Expected format:
 
   host_time_s,device_millis,vswr,forward_v,reverse_v,motor1_pos_rad,motor2_pos_rad,at_match
 
-VSWR outside [-50, 50] are dropped.
+VSWR outside [0, 50] are dropped.
 
-For large files, data is binned for display (mean + VSWR min/max ribbon) so plots
-stay readable without manual downsampling.
+For large files, plotting uses time-based downsampling (default every 0.5 s),
+keeping real samples instead of VSWR averages.
 """
 from __future__ import annotations
 
@@ -17,17 +17,17 @@ import argparse
 import csv
 import os
 import sys
+from datetime import datetime, timedelta
 from typing import Any, Dict, Tuple
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 import numpy as np
 
 DATA_CSV_DIR = os.path.join("data", "csv")
 DATA_HTML_DIR = os.path.join("data", "html")
+DATA_MERMAID_DIR = os.path.join("data", "mermaid")
 
 # Drop VSWR outliers (garbage spikes)
-VSWR_ABS_MAX = 50.0
+VSWR_MAX = 4.0
 
 
 def resolve_input_csv(path: str) -> str:
@@ -54,6 +54,229 @@ def resolve_html_output(html_arg: str | None, input_csv: str) -> str | None:
     return os.path.join(DATA_HTML_DIR, html_arg)
 
 
+def resolve_mermaid_output(mermaid_arg: str | None, input_csv: str) -> str | None:
+    """Map --mermaid to a path; bare names and empty (auto) go under data/mermaid/."""
+    if mermaid_arg is None:
+        return None
+    if mermaid_arg == "":
+        stem = os.path.splitext(os.path.basename(input_csv))[0]
+        return os.path.join(DATA_MERMAID_DIR, f"{stem}.mmd")
+    if os.path.isabs(mermaid_arg) or os.path.dirname(mermaid_arg):
+        return mermaid_arg
+    return os.path.join(DATA_MERMAID_DIR, mermaid_arg)
+
+
+def _write_mermaid_series_chart(
+    path: str,
+    tx: np.ndarray,
+    series: np.ndarray,
+    series_label: str,
+    xlabel: str,
+    title: str,
+    y_axis_bounds: tuple[float, float] | None = None,
+    render_mode: str = "line",
+) -> None:
+    """
+    Write Mermaid xychart-beta code for one telemetry series.
+    """
+    if tx.size == 0:
+        raise ValueError("Cannot write Mermaid chart with no samples.")
+
+    def fmt_vals(arr: np.ndarray) -> list[str]:
+        data = np.asarray(arr, dtype=np.float64).copy()
+        if data.size == 0:
+            return []
+        finite = np.isfinite(data)
+        if not finite.any():
+            data[:] = 0.0
+        else:
+            first = int(np.argmax(finite))
+            data[:first] = data[first]
+            for i in range(first + 1, data.size):
+                if not np.isfinite(data[i]):
+                    data[i] = data[i - 1]
+        return [f"{float(y):.3f}".rstrip("0").rstrip(".") for y in data]
+
+    series_vals = fmt_vals(series)
+
+    # Use numeric range axis to avoid huge categorical x-axis lists.
+    x_start = float(tx[0])
+    x_end = float(tx[-1])
+    if x_end <= x_start:
+        x_end = x_start + 1.0
+    finite_vals = np.asarray(series, dtype=np.float64)
+    finite_vals = finite_vals[np.isfinite(finite_vals)]
+    if finite_vals.size:
+        y_min = float(np.min(finite_vals))
+        y_max = float(np.max(finite_vals))
+    else:
+        y_min = 0.0
+        y_max = 1.0
+    if y_axis_bounds is None:
+        y_lo = np.floor(y_min * 10.0) / 10.0
+        y_hi = np.ceil(y_max * 10.0) / 10.0
+        if y_hi <= y_lo:
+            y_hi = y_lo + 1.0
+    else:
+        y_lo, y_hi = y_axis_bounds
+
+    plot_stmt = "line" if render_mode == "line" else "bar"
+
+    lines = [
+        "xychart-beta",
+        f'    title "{os.path.basename(title)} {series_label}"',
+        f'    x-axis "{xlabel}" {x_start:g} --> {x_end:g}',
+        f'    y-axis "{series_label}" {y_lo:g} --> {y_hi:g}',
+        f'    {plot_stmt} [{", ".join(series_vals)}]',
+    ]
+
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _write_mermaid_match_gantt(
+    path: str,
+    tx: np.ndarray,
+    matched: np.ndarray,
+    title: str,
+    *,
+    time_unit: str,
+) -> None:
+    """Write Mermaid gantt code for match/no-match intervals."""
+    if tx.size == 0 or matched.size == 0 or tx.size != matched.size:
+        raise ValueError("Cannot write Mermaid match gantt with invalid sample arrays.")
+
+    tm = np.asarray(tx, dtype=np.float64).copy()
+    if time_unit == "seconds":
+        tm = tm / 60.0  # Mermaid gantt format below uses minute values.
+
+    state = np.asarray(matched >= 0.5, dtype=bool)
+    change_idx = np.flatnonzero(np.diff(state.astype(np.int8)) != 0) + 1
+    starts = np.concatenate(([0], change_idx))
+
+    pos_steps = np.diff(tm)
+    pos_steps = pos_steps[np.isfinite(pos_steps) & (pos_steps > 0)]
+    min_step = float(np.min(pos_steps)) if pos_steps.size else 1.0
+
+    def to_min_token(v: float) -> int:
+        return int(np.floor(float(v)))
+
+    base_dt = datetime(2000, 1, 1, 0, 0, 0)
+
+    def fmt_dt(minute_offset: int) -> str:
+        return (base_dt + timedelta(minutes=int(minute_offset))).strftime("%Y-%m-%d %H:%M")
+
+    lines = [
+        "%%{init: {'themeVariables': {"
+        "'sectionBkgColor': '#ffffff00', "
+        "'sectionBkgColor2': '#ffffff00', "
+        "'sectionBorderColor': '#94a3b8', "
+        "'taskBkgColor': '#2563eb', "
+        "'taskBorderColor': '#1d4ed8', "
+        "'activeTaskBkgColor': '#16a34a', "
+        "'activeTaskBorderColor': '#15803d', "
+        "'doneTaskBkgColor': '#64748b', "
+        "'doneTaskBorderColor': '#475569', "
+        "'critTaskBkgColor': '#dc2626', "
+        "'critTaskBorderColor': '#b91c1c', "
+        "'ganttSectionBkgColor': '#ffffff00', "
+        "'ganttSectionBkgColor2': '#ffffff00', "
+        "'ganttSectionBorderColor': '#94a3b8', "
+        "'ganttTaskBkgColor': '#2563eb', "
+        "'ganttTaskBorderColor': '#1d4ed8', "
+        "'ganttActiveTaskBkgColor': '#16a34a', "
+        "'ganttActiveTaskBorderColor': '#15803d', "
+        "'ganttDoneTaskBkgColor': '#64748b', "
+        "'ganttDoneTaskBorderColor': '#475569', "
+        "'ganttCritTaskBkgColor': '#dc2626', "
+        "'ganttCritTaskBorderColor': '#b91c1c', "
+        "'lineColor': '#64748b'"
+        "}}}%%",
+        "gantt",
+        f'    title {os.path.basename(title)} Match Timeline',
+        "    dateFormat  YYYY-MM-DD HH:mm",
+        "    axisFormat  %H:%M",
+        "",
+        "    section .",
+    ]
+
+    # Build a single monotonic boundary list so adjacent tasks do not overlap.
+    # Start boundary is floored, interior transition boundaries are rounded to nearest
+    # minute, and final boundary is ceiled to include the tail.
+    boundaries = [to_min_token(float(tm[starts[0]]))]
+    if starts.size > 1:
+        for idx in starts[1:]:
+            boundaries.append(int(np.rint(float(tm[idx]))))
+    boundaries.append(int(np.ceil(float(tm[-1]))))
+
+    # Enforce strictly increasing boundaries to satisfy Mermaid duration parsing.
+    for i in range(1, len(boundaries)):
+        if boundaries[i] <= boundaries[i - 1]:
+            boundaries[i] = boundaries[i - 1] + 1
+
+    for i, run_start in enumerate(starts):
+        start_tok = boundaries[i]
+        end_tok = boundaries[i + 1]
+        label = "YES" if state[run_start] else "NO"
+        status = "active" if state[run_start] else "crit"
+        lines.append(f"    {label} :{status}, {fmt_dt(start_tok)}, {fmt_dt(end_tok)}")
+
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_mermaid_xycharts(
+    path: str,
+    tx: np.ndarray,
+    pack: Dict[str, np.ndarray],
+    xlabel: str,
+    title: str,
+) -> list[str]:
+    """Write one Mermaid file per telemetry series and return file paths."""
+    abs_path = os.path.abspath(path)
+    out_dir = os.path.dirname(abs_path)
+    stem, ext = os.path.splitext(os.path.basename(abs_path))
+    if not ext:
+        ext = ".mmd"
+
+    targets = [
+        ("vswr", pack["vswr"], "VSWR", None, "line"),
+        ("motor1", pack["motor1"], "Motor1", None, "line"),
+        ("motor2", pack["motor2"], "Motor2", None, "line"),
+    ]
+    written = []
+    for suffix, series, label, axis_bounds, render_mode in targets:
+        out_path = os.path.join(out_dir, f"{stem}_{suffix}{ext}")
+        _write_mermaid_series_chart(
+            out_path,
+            tx,
+            series,
+            label,
+            xlabel,
+            title,
+            y_axis_bounds=axis_bounds,
+            render_mode=render_mode,
+        )
+        written.append(out_path)
+
+    match_path = os.path.join(out_dir, f"{stem}_match{ext}")
+    _write_mermaid_match_gantt(
+        match_path,
+        tx,
+        pack["matched"],
+        title,
+        time_unit="minutes" if "min" in xlabel.lower() else "seconds",
+    )
+    written.append(match_path)
+    return written
+
+
 def parse_float_or_nan(s: str) -> float:
     t = s.strip().lower()
     if t in ("", "nan", "none"):
@@ -71,12 +294,18 @@ def parse_args():
         "--max-plot-points",
         type=int,
         default=4000,
-        help="Max horizontal bins for drawing (dense files are aggregated; default 4000).",
+        help="Deprecated; ignored. Use --sample-interval to control downsampling.",
     )
     parser.add_argument(
         "--raw",
         action="store_true",
-        help="Plot every sample as lines (slow/ugly on huge files). Overrides aggregation.",
+        help="Plot every sample as lines (disables time-based downsampling).",
+    )
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between plotted samples in non-raw mode (default: 0.5).",
     )
     parser.add_argument(
         "--minutes",
@@ -96,6 +325,15 @@ def parse_args():
         metavar="PATH",
         help="Write Plotly HTML. Omit PATH for data/html/<input_stem>.html; "
         "a bare filename is written under data/html/.",
+    )
+    parser.add_argument(
+        "--mermaid",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Write Mermaid xychart code (.mmd). Omit PATH for data/mermaid/<input_stem>.mmd; "
+        "a bare filename is written under data/mermaid/.",
     )
     return parser.parse_args()
 
@@ -129,7 +367,7 @@ def load_csv(path: str) -> Tuple[list, int, int]:
                 skipped_invalid += 1
                 continue
 
-            if not (-VSWR_ABS_MAX <= vswr <= VSWR_ABS_MAX):
+            if not (0 <= vswr <= VSWR_MAX):
                 skipped_invalid += 1
                 continue
 
@@ -138,63 +376,41 @@ def load_csv(path: str) -> Tuple[list, int, int]:
     return rows, skipped_format, skipped_invalid
 
 
-def _nanmean(a: np.ndarray) -> float:
-    m = np.nanmean(a)
-    return float(m) if np.isfinite(m) else float("nan")
-
-
-def bin_aggregate(
+def time_downsample(
     t: np.ndarray,
     vswr: np.ndarray,
     motor1: np.ndarray,
     motor2: np.ndarray,
     matched: np.ndarray,
-    max_bins: int,
+    sample_interval: float,
 ) -> Tuple[np.ndarray, dict]:
-    """Reduce arrays to at most max_bins contiguous slices (mean + VSWR min/max)."""
+    """Keep real samples, selecting one point approximately every sample_interval."""
     n = len(t)
-    if n <= max_bins:
+    if n == 0 or sample_interval <= 0:
         return t, {
             "mode": "raw",
             "vswr": vswr,
-            "vswr_min": vswr,
-            "vswr_max": vswr,
             "motor1": motor1,
             "motor2": motor2,
             "matched": matched,
         }
 
-    edges = np.linspace(0, n, max_bins + 1, dtype=np.int64)
-    centers = []
-    v_mean = []
-    v_min = []
-    v_max = []
-    m1_mean = []
-    m2_mean = []
-    match_last = []
+    keep = [0]
+    last_t = t[0]
+    for i in range(1, n):
+        if (t[i] - last_t) >= sample_interval:
+            keep.append(i)
+            last_t = t[i]
+    if keep[-1] != n - 1:
+        keep.append(n - 1)
 
-    for i in range(max_bins):
-        lo = int(edges[i])
-        hi = int(edges[i + 1])
-        if hi <= lo:
-            continue
-        sl = slice(lo, hi)
-        centers.append(np.mean(t[sl]))
-        v_mean.append(np.mean(vswr[sl]))
-        v_min.append(np.min(vswr[sl]))
-        v_max.append(np.max(vswr[sl]))
-        m1_mean.append(_nanmean(motor1[sl]))
-        m2_mean.append(_nanmean(motor2[sl]))
-        match_last.append(float(matched[hi - 1]))
-
-    return np.asarray(centers), {
-        "mode": "binned",
-        "vswr": np.asarray(v_mean),
-        "vswr_min": np.asarray(v_min),
-        "vswr_max": np.asarray(v_max),
-        "motor1": np.asarray(m1_mean),
-        "motor2": np.asarray(m2_mean),
-        "matched": np.asarray(match_last),
+    idx = np.asarray(keep, dtype=np.int64)
+    return t[idx], {
+        "mode": "sampled",
+        "vswr": vswr[idx],
+        "motor1": motor1[idx],
+        "motor2": motor2[idx],
+        "matched": matched[idx],
     }
 
 
@@ -238,48 +454,17 @@ def plot_plotly(
         subplot_titles=sub_titles,
     )
 
-    # VSWR ribbon + mean
-    if pack["mode"] == "binned":
-        x_band = np.concatenate([tx, tx[::-1]])
-        y_band = np.concatenate([pack["vswr_max"], pack["vswr_min"][::-1]])
-        fig.add_trace(
-            go.Scatter(
-                x=x_band,
-                y=y_band,
-                fill="toself",
-                fillcolor="rgba(107, 174, 214, 0.35)",
-                line=dict(color="rgba(255,255,255,0)", width=0),
-                name="VSWR range (per bin)",
-                legendgroup="vswr",
-                hoverinfo="skip",
-            ),
-            row=1,
-            col=1,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=tx,
-                y=pack["vswr"],
-                mode="lines",
-                line=dict(color="#08519c", width=2),
-                name="VSWR (mean)",
-                legendgroup="vswr",
-            ),
-            row=1,
-            col=1,
-        )
-    else:
-        fig.add_trace(
-            go.Scatter(
-                x=tx,
-                y=pack["vswr"],
-                mode="lines",
-                line=dict(color="#08519c", width=1),
-                name="VSWR",
-            ),
-            row=1,
-            col=1,
-        )
+    fig.add_trace(
+        go.Scatter(
+            x=tx,
+            y=pack["vswr"],
+            mode="lines",
+            line=dict(color="#08519c", width=1),
+            name="VSWR",
+        ),
+        row=1,
+        col=1,
+    )
 
     fig.add_hline(y=1.2, line_dash="dash", line_color="#238b45", row=1, col=1)
     fig.add_hline(y=1.4, line_dash="dash", line_color="#cb6816", row=1, col=1)
@@ -358,6 +543,12 @@ def plot_plotly(
 
 
 def apply_style():
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise SystemExit(
+            "matplotlib is required for static plotting. Install with: python -m pip install matplotlib"
+        ) from exc
     plt.rcParams.update(
         {
             "figure.facecolor": "#f8f9fa",
@@ -423,11 +614,28 @@ def main():
         xlabel = "Time (s)"
         use_minutes = False
 
-    max_bins = len(t_plot) if args.raw else max(200, args.max_plot_points)
-    tx, pack = bin_aggregate(t_plot, vswr, motor1, motor2, matched, max_bins)
+    sample_interval = 0.0 if args.raw else max(0.0, args.sample_interval)
+    tx, pack = time_downsample(t_plot, vswr, motor1, motor2, matched, sample_interval)
+    if not args.raw:
+        print(
+            f"Display: {len(tx):,} sampled points "
+            f"(every ~{sample_interval:g} s, real VSWR samples)"
+        )
 
-    if pack["mode"] == "binned":
-        print(f"Display: {len(tx):,} time bins (mean + VSWR min/max band from raw samples)")
+    mermaid_out = resolve_mermaid_output(args.mermaid, csv_path)
+    if mermaid_out:
+        written_paths = write_mermaid_xycharts(
+            mermaid_out,
+            tx,
+            pack,
+            xlabel,
+            csv_path,
+        )
+        print("Wrote Mermaid charts:")
+        for p in written_paths:
+            print(f"  - {p}")
+        if not args.interactive and args.html is None:
+            return
 
     if args.interactive or args.html is not None:
         html_out = resolve_html_output(args.html, csv_path)
@@ -445,6 +653,14 @@ def main():
             html_path=html_out,
         )
         return
+
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+    except ImportError as exc:
+        raise SystemExit(
+            "matplotlib is required for static plotting. Install with: python -m pip install matplotlib"
+        ) from exc
 
     apply_style()
 
@@ -471,26 +687,8 @@ def main():
 
     fig.suptitle(csv_path, fontsize=9, color="#666666", y=0.995)
 
-    # --- VSWR: ribbon + mean ---
-    if pack["mode"] == "binned":
-        ax_vswr.fill_between(
-            tx,
-            pack["vswr_min"],
-            pack["vswr_max"],
-            alpha=0.35,
-            color="#6baed6",
-            linewidth=0,
-            label="VSWR range (per bin)",
-        )
-        ax_vswr.plot(
-            tx,
-            pack["vswr"],
-            color="#08519c",
-            linewidth=1.4,
-            label="VSWR (mean)",
-        )
-    else:
-        ax_vswr.plot(tx, pack["vswr"], color="#08519c", linewidth=0.7, alpha=0.85, label="VSWR")
+    # --- VSWR (real samples; optionally downsampled in time) ---
+    ax_vswr.plot(tx, pack["vswr"], color="#08519c", linewidth=0.8, alpha=0.9, label="VSWR")
 
     ax_vswr.axhline(1.2, color="#238b45", linestyle="--", linewidth=1.0, alpha=0.9, label="Match ≤ 1.2")
     ax_vswr.axhline(1.4, color="#cb6816", linestyle="--", linewidth=1.0, alpha=0.9, label="Unmatch ≥ 1.4")
