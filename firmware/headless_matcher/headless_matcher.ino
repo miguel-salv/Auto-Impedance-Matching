@@ -1,18 +1,25 @@
+/*
+ * headless_matcher.ino
+ * Headless Matcher — Teensy 4.1
+ *
+ * Dependencies (Arduino Library Manager):
+ *   TMCStepper
+ */
+
 #include <Arduino.h>
 #include <TMCStepper.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 
-// --- PIN CONFIGURATION ---
 const int STEP_PIN_1 = 2;
 const int DIR_PIN_1 = 3;
 const int STEP_PIN_2 = 9;
 const int DIR_PIN_2 = 10;
-const int RX_PIN = 0;   // Hardware RX for Serial1 on Teensy 4.0
-const int TX_PIN = 1;   // Hardware TX for Serial1 on Teensy 4.0
 const int FWD_PIN = 25;
 const int REV_PIN = 24;
 const int TRANSMIT_PIN = 31;
 
-// --- TMC2209 UART CONFIGURATION ---
 #define SERIAL_PORT Serial1
 #define R_SENSE 0.11f
 #define DRV_ADDRESS_1 0b00
@@ -21,47 +28,300 @@ const int TRANSMIT_PIN = 31;
 TMC2209Stepper driver1(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_1);
 TMC2209Stepper driver2(&SERIAL_PORT, R_SENSE, DRV_ADDRESS_2);
 
-// --- SETTINGS ---
-#define STALL_VALUE 140
 #define STEP_DELAY 200
-#define POLL_INTERVAL 10
-#define STREAM_PLOT_DATA 1
-
-//--- MECH SPECS ---
 #define STEPS_PER_RAD 63.66197f
 #define MICROSTEPS_PER_STEP 32
 #define MAX_ROT 3.14159f
 #define GRAD_SCALE 0.025f
+#define MAX_STEPSIZE (PI / 36.0f)
+#define MIN_STEPSIZE (PI / 700.0f)
+#define SCHED_LOOP_MS 16u
 
-#define GRAD_DEADBAND .001f
+const float samp_num = 300.0f;
 
-#define MAX_STEPSIZE PI/36
-#define MIN_STEPSIZE PI/700
-
-// --- POSITION TRACKING ---
-float motor1_pos = 2 * PI;
-float motor2_pos = 2 * PI;
-
-bool dir1 = true;
-bool dir2 = true;
-
-float dM1 = 0.1;
-float dM2 = 0.1;
-
-float SWR;
-
-const float samp_num = 300.0;
-
+enum OpMode { MODE_AUTO, MODE_MANUAL };
+OpMode opMode = MODE_AUTO;
+bool radioTX = false;
 bool atMatch = false;
 
-// Custom Teensy replacement for ESP32's analogReadMilliVolts
-float analogReadMilliVolts(int pin) {
-  int rawValue = analogRead(pin);
-  // Convert 12-bit reading (0-4095) to millivolts using a 3.3V (3300mV) reference
-  return (rawValue / 4095.0) * 3300.0;
+float motor1_pos = 2.0f * PI;
+float motor2_pos = 2.0f * PI;
+float dM1 = 0.1f;
+float dM2 = 0.1f;
+
+long motor1Pos = 0;
+long motor2Pos = 0;
+
+float lastVSWR = 1.0f;
+float lastFwdV = 0.0f;
+float lastRevV = 0.0f;
+static uint32_t lastStatusMs = 0;
+bool csvStreamEnabled = false;
+
+static float analogReadMilliVolts(int pin);
+static float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, float &motor_pos, bool ignoreLimits = false);
+static void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gradient, float &motor_pos);
+static float clampMagnitude(float value, float minMagnitude, float maxMagnitude);
+static float stepsToRad(int steps);
+static int radToSteps(float rads);
+static float sampVSWR(int fwd, int rev);
+static void takeStep(int stepPin);
+static int round_up(float value);
+static void printHelp();
+static void printStatus();
+static void processSerialCommand();
+static void handleCommand(char *line);
+static void setRadioTX(bool enabled);
+static void syncMotorDeg();
+static bool parseLongArg(const char *arg, long *out);
+static void setMotor1Step(long posDeg);
+static void setMotor2Step(long posDeg);
+
+void setup() {
+  analogReadResolution(12);
+
+  Serial.begin(500000);
+  while (!Serial && millis() < 3000) {
+  }
+
+  pinMode(STEP_PIN_1, OUTPUT);
+  pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(STEP_PIN_2, OUTPUT);
+  pinMode(DIR_PIN_2, OUTPUT);
+  pinMode(TRANSMIT_PIN, OUTPUT);
+  digitalWrite(TRANSMIT_PIN, LOW);  // HIGH = TX on for this hardware; LOW at boot = TX off
+
+  SERIAL_PORT.begin(500000, SERIAL_8N1);
+  delay(500);
+
+  Serial.println("Starting Homing Sequence...");
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, -PI, motor1_pos, true);
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, -PI, motor2_pos, true);
+  motor1_pos = 0.0f;
+  motor2_pos = 0.0f;
+  Serial.println("Finished Homing Sequence...");
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, PI / 2.0f, motor1_pos, true);
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, PI / 2.0f, motor2_pos, true);
+
+  syncMotorDeg();
+  printHelp();
+  printStatus();
 }
 
-float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, float &motor_pos, bool ignoreLimits = false) {
+void loop() {
+  processSerialCommand();
+
+  if (opMode == MODE_AUTO) {
+    if (!atMatch) {
+      calcGradAndStep(driver1, STEP_PIN_1, DIR_PIN_1, dM1, motor1_pos);
+      calcGradAndStep(driver2, STEP_PIN_2, DIR_PIN_2, dM2, motor2_pos);
+    } else {
+      sampVSWR(FWD_PIN, REV_PIN);
+    }
+  } else {
+    // Keep telemetry fresh in manual mode too.
+    sampVSWR(FWD_PIN, REV_PIN);
+  }
+
+  syncMotorDeg();
+
+  const bool statusPeriodically = !csvStreamEnabled;
+  if (statusPeriodically && millis() - lastStatusMs >= 1000u) {
+    lastStatusMs = millis();
+    printStatus();
+  }
+
+  delay(SCHED_LOOP_MS);
+}
+
+static void processSerialCommand() {
+  static char line[64];
+  static size_t len = 0;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (len > 0) {
+        line[len] = '\0';
+        handleCommand(line);
+        len = 0;
+      }
+      continue;
+    }
+    if (len + 1 < sizeof(line)) {
+      line[len++] = c;
+    }
+  }
+}
+
+static void handleCommand(char *line) {
+  char *cmd = strtok(line, " \t");
+  if (!cmd) return;
+
+  if (strcasecmp(cmd, "help") == 0 || strcmp(cmd, "?") == 0) {
+    printHelp();
+    return;
+  }
+  if (strcasecmp(cmd, "mode") == 0) {
+    char *arg = strtok(nullptr, " \t");
+    if (!arg) {
+      Serial.println("ERR mode needs: auto|manual");
+      return;
+    }
+    if (strcasecmp(arg, "auto") == 0) {
+      opMode = MODE_AUTO;
+      Serial.println("OK mode=auto");
+      return;
+    }
+    if (strcasecmp(arg, "manual") == 0) {
+      opMode = MODE_MANUAL;
+      Serial.println("OK mode=manual");
+      return;
+    }
+    Serial.println("ERR mode must be auto|manual");
+    return;
+  }
+  if (strcasecmp(cmd, "tx") == 0) {
+    char *arg = strtok(nullptr, " \t");
+    if (!arg) {
+      Serial.println("ERR tx needs: on|off");
+      return;
+    }
+    if (strcasecmp(arg, "on") == 0) {
+      setRadioTX(true);
+      Serial.println("OK tx=on");
+      return;
+    }
+    if (strcasecmp(arg, "off") == 0) {
+      setRadioTX(false);
+      Serial.println("OK tx=off");
+      return;
+    }
+    Serial.println("ERR tx must be on|off");
+    return;
+  }
+  if (strcasecmp(cmd, "m1") == 0 || strcasecmp(cmd, "m2") == 0) {
+    if (opMode != MODE_MANUAL) {
+      Serial.println("ERR manual mode required for motor set");
+      return;
+    }
+    char *arg = strtok(nullptr, " \t");
+    long deg = 0;
+    if (!parseLongArg(arg, &deg)) {
+      Serial.println("ERR motor command needs angle 0..180");
+      return;
+    }
+    deg = constrain(deg, 0L, 180L);
+    if (strcasecmp(cmd, "m1") == 0) setMotor1Step(deg);
+    else setMotor2Step(deg);
+    syncMotorDeg();
+    Serial.println("OK motor updated");
+    return;
+  }
+  if (strcasecmp(cmd, "home") == 0) {
+    Serial.println("Re-homing...");
+    turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, -PI, motor1_pos, true);
+    turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, -PI, motor2_pos, true);
+    motor1_pos = 0.0f;
+    motor2_pos = 0.0f;
+    turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, PI / 2.0f, motor1_pos, true);
+    turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, PI / 2.0f, motor2_pos, true);
+    syncMotorDeg();
+    Serial.println("OK homed");
+    return;
+  }
+  if (strcasecmp(cmd, "stream") == 0) {
+    char *arg = strtok(nullptr, " \t");
+    if (!arg) {
+      Serial.println("ERR stream needs: on|off");
+      return;
+    }
+    if (strcasecmp(arg, "on") == 0) {
+      csvStreamEnabled = true;
+      Serial.println("OK stream=on");
+      return;
+    }
+    if (strcasecmp(arg, "off") == 0) {
+      csvStreamEnabled = false;
+      Serial.println("OK stream=off");
+      return;
+    }
+    Serial.println("ERR stream must be on|off");
+    return;
+  }
+  Serial.println("ERR unknown command. Type: help");
+}
+
+static void printHelp() {
+  Serial.println();
+  Serial.println("Commands:");
+  Serial.println("  help              - show commands");
+  Serial.println("  mode auto|manual  - set operation mode");
+  Serial.println("  tx on|off         - radio transmit switch");
+  Serial.println("  m1 <deg>          - set motor 1 (manual only)");
+  Serial.println("  m2 <deg>          - set motor 2 (manual only)");
+  Serial.println("  home              - run homing sequence");
+  Serial.println("  stream on|off     - VSWR_CSV lines for live.py / plot logging");
+  Serial.println();
+}
+
+static void printStatus() {
+  Serial.print("STATE mode=");
+  Serial.print(opMode == MODE_AUTO ? "AUTO" : "MANUAL");
+  Serial.print(" tx=");
+  Serial.print(radioTX ? "ON" : "OFF");
+  Serial.print(" atMatch=");
+  Serial.print(atMatch ? "1" : "0");
+  Serial.print(" m1_deg=");
+  Serial.print(motor1Pos);
+  Serial.print(" m2_deg=");
+  Serial.print(motor2Pos);
+  Serial.print(" vswr=");
+  Serial.print(lastVSWR, 3);
+  Serial.print(" fwdV=");
+  Serial.print(lastFwdV, 3);
+  Serial.print(" revV=");
+  Serial.println(lastRevV, 3);
+}
+
+static void syncMotorDeg() {
+  motor1Pos = constrain((long)(motor1_pos * (180.0f / PI)), 0L, 180L);
+  motor2Pos = constrain((long)(motor2_pos * (180.0f / PI)), 0L, 180L);
+}
+
+static void setRadioTX(bool enabled) {
+  radioTX = enabled;
+  digitalWrite(TRANSMIT_PIN, enabled ? HIGH : LOW);
+}
+
+static bool parseLongArg(const char *arg, long *out) {
+  if (!arg || !out) return false;
+  char *end = nullptr;
+  long parsed = strtol(arg, &end, 10);
+  if (!end || *end != '\0') return false;
+  *out = parsed;
+  return true;
+}
+
+static void setMotor1Step(long posDeg) {
+  float targetRad = posDeg * (PI / 180.0f);
+  float delta = targetRad - motor1_pos;
+  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, delta, motor1_pos);
+}
+
+static void setMotor2Step(long posDeg) {
+  float targetRad = posDeg * (PI / 180.0f);
+  float delta = targetRad - motor2_pos;
+  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, delta, motor2_pos);
+}
+
+static float analogReadMilliVolts(int pin) {
+  int rawValue = analogRead(pin);
+  return (rawValue / 4095.0f) * 3300.0f;
+}
+
+static float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, float &motor_pos, bool ignoreLimits) {
+  (void)driver;
   if (rads == 0.0f) {
     return 0.0f;
   }
@@ -94,238 +354,93 @@ float turnByRad(TMC2209Stepper &driver, int stepPin, int dirPin, float rads, flo
   return steps_taken * position_change;
 }
 
-void setup() {
-  // Maximize Teensy ADC resolution for accurate readings
-  analogReadResolution(12);
-  
-  Serial.begin(500000);
-  while (!Serial && millis() < 3000)
-    ;
-
-  pinMode(STEP_PIN_1, OUTPUT);
-  pinMode(DIR_PIN_1, OUTPUT);
-  pinMode(STEP_PIN_2, OUTPUT);
-  pinMode(DIR_PIN_2, OUTPUT);
-
-  digitalWrite(DIR_PIN_1, dir1);
-  digitalWrite(DIR_PIN_2, dir2);
-  digitalWrite(TRANSMIT_PIN, HIGH);
-
-  // Initialize hardware serial using Teensy's standard method
-  SERIAL_PORT.begin(500000, SERIAL_8N1);
-  delay(500);
-
-  // Configure Driver 1
-  // driver1.begin();
-  // driver1.toff(5);
-  // driver1.rms_current(800);
-  // driver1.microsteps(16);
-  // driver1.en_spreadCycle(false);
-  // driver1.pwm_autoscale(true);
-  // driver1.TCOOLTHRS(0xFFFFF);
-  // driver1.SGTHRS(STALL_VALUE);
-
-  // // Configure Driver 2
-  // driver2.begin();
-  // driver2.toff(5);
-  // driver2.rms_current(800);
-  // driver2.microsteps(16);
-  // driver2.en_spreadCycle(false);
-  // driver2.pwm_autoscale(true);
-  // driver2.TCOOLTHRS(0xFFFFF);
-  // driver2.SGTHRS(STALL_VALUE);
-  
-  // testUART(driver1, 1);
-  // testUART(driver2, 2);
-
-  Serial.println("Starting Homing Sequence...");
-  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, -1 * PI, motor1_pos, true);
-  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, -1 * PI, motor2_pos, true);
-
-  motor1_pos = 0;
-  motor2_pos = 0;
-  Serial.println("Finished Homing Sequence...");
-  turnByRad(driver1, STEP_PIN_1, DIR_PIN_1, PI/2, motor1_pos, true);
-  turnByRad(driver2, STEP_PIN_2, DIR_PIN_2, PI/2, motor2_pos, true);
-}
-
-void loop() {
-  if (!atMatch) {
-    calcGradAndStep(driver1, STEP_PIN_1, DIR_PIN_1, dM1, motor1_pos);
-    //Serial.print("motor1: ");
-    //Serial.print(motor1_pos);
-    calcGradAndStep(driver2, STEP_PIN_2, DIR_PIN_2, dM2, motor2_pos);
-    //Serial.print(" motor2: ");
-    //Serial.print(motor2_pos);
-  } else {
-    sampVSWR(FWD_PIN, REV_PIN);
-    Serial.println("At match");
-  }
-
-  // Serial.print(" Voltage Read REV:");
-  // Serial.println(readPinVoltage(REV_PIN));
-  // Serial.print(" Voltage Read FWD:");
-  // Serial.println(readPinVoltage(FWD_PIN));
-}
-
-
-void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gradient, float &motor_pos) {
-
-  // if (gradient > -GRAD_DEADBAND && gradient < GRAD_DEADBAND) {
-  //   return;
-  // }
-
+static void calcGradAndStep(TMC2209Stepper &driver, int stepPin, int dirPin, float &gradient, float &motor_pos) {
   float initialCost = sampVSWR(FWD_PIN, REV_PIN);
-  //Serial.println(gradient);
-  
   float commandedStepSize = gradient * GRAD_SCALE;
-
   commandedStepSize = clampMagnitude(commandedStepSize, MIN_STEPSIZE, MAX_STEPSIZE);
-  bool hittingUpperLimit = (motor_pos >= MAX_ROT-MIN_STEPSIZE) ;
+
+  bool hittingUpperLimit = (motor_pos >= MAX_ROT - MIN_STEPSIZE);
   bool hittingLowerLimit = (motor_pos <= MIN_STEPSIZE);
-  if(hittingUpperLimit){
-    commandedStepSize = -MIN_STEPSIZE;
-  }
-  if(hittingLowerLimit){
-    commandedStepSize = MIN_STEPSIZE;
-  }
+  if (hittingUpperLimit) commandedStepSize = -MIN_STEPSIZE;
+  if (hittingLowerLimit) commandedStepSize = MIN_STEPSIZE;
 
-
-  float actualTravel = turnByRad(driver, stepPin, dirPin,commandedStepSize, motor_pos);
-
+  float actualTravel = turnByRad(driver, stepPin, dirPin, commandedStepSize, motor_pos);
   delay(5);
   if (actualTravel != 0.0f) {
     gradient = (initialCost - sampVSWR(FWD_PIN, REV_PIN)) / actualTravel;
   }
 }
 
-float clampMagnitude(float value, float minMagnitude, float maxMagnitude) {
-    float magnitude = (value < 0.0f) ? -value : value;
-    float sign = (value < 0.0f) ? -1.0f : 1.0f;
-    if (magnitude > maxMagnitude) {
-        return maxMagnitude * sign;
-    }
-
-    if (magnitude < minMagnitude) {
-        return minMagnitude * sign;
-    }
-
-    return value;
+static float clampMagnitude(float value, float minMagnitude, float maxMagnitude) {
+  float magnitude = (value < 0.0f) ? -value : value;
+  float sign = (value < 0.0f) ? -1.0f : 1.0f;
+  if (magnitude > maxMagnitude) return maxMagnitude * sign;
+  if (magnitude < minMagnitude) return minMagnitude * sign;
+  return value;
 }
 
-float calcSWR() {
-  float err1 = motor1_pos - 2 * PI;
-  float err2 = motor2_pos - (PI / 2.0f);
-  return (err1 * err1) + (err2 * err2);
-}
-
-float stepsToRad(int steps) {
+static float stepsToRad(int steps) {
   return steps / (STEPS_PER_RAD * MICROSTEPS_PER_STEP);
 }
 
-int radToSteps(float rads) {
+static int radToSteps(float rads) {
   return round_up(rads * (STEPS_PER_RAD * MICROSTEPS_PER_STEP));
 }
 
-void testUART(TMC2209Stepper &driver, int drivNum) {
-  uint8_t conn_result = driver.test_connection();
-  if (conn_result == 0) {
-    Serial.print("UART connection successful: ");
-    Serial.println(drivNum);
-  } else {
-    Serial.print("UART connection FAILED. Error code: ");
-    Serial.println(conn_result);
-    while (1)
-      ;  // Halt the program so you can fix the wiring
-  }
-}
-
-float sampVSWR(int fwd, int rev){
-  float sum_fwd = 0.0;
-  float sum_rev = 0.0;
-  for (int i = 0; i < samp_num; i++) {
-    // Read the voltage in mV using custom Teensy function
+static float sampVSWR(int fwd, int rev) {
+  float sum_fwd = 0.0f;
+  float sum_rev = 0.0f;
+  for (int i = 0; i < (int)samp_num; i++) {
     sum_fwd += analogReadMilliVolts(fwd);
     sum_rev += analogReadMilliVolts(rev);
     delayMicroseconds(15);
   }
-  // Calculate Average Millivolts
+
   float averageMv_fwd = sum_fwd / samp_num;
   float averageMv_rev = sum_rev / samp_num;
-  // Convert mV to Volts
-  float vswr = (averageMv_fwd + averageMv_rev) / ((averageMv_fwd - averageMv_rev));
+  float denom = averageMv_fwd - averageMv_rev;
+  float vswr = (denom != 0.0f) ? (averageMv_fwd + averageMv_rev) / denom : 99.0f;
   float loss = (vswr - 1.0f);
   loss = loss * loss;
+
+  lastVSWR = vswr;
+  lastFwdV = averageMv_fwd / 1000.0f;
+  lastRevV = averageMv_rev / 1000.0f;
 
   if (vswr > 1.4f) atMatch = false;
   if (vswr < 1.2f) atMatch = true;
 
-#if STREAM_PLOT_DATA
-  // Machine-readable stream: tag,millis,vswr,fwd_V,rev_V,motor1_pos,motor2_pos,at_match
-  Serial.print("VSWR_CSV,");
-  Serial.print(millis());
-  Serial.print(",");
-  Serial.print(vswr, 6);
-  Serial.print(",");
-  Serial.print(averageMv_fwd / 1000.0f, 6);
-  Serial.print(",");
-  Serial.print(averageMv_rev / 1000.0f, 6);
-  Serial.print(",");
-  Serial.print(motor1_pos, 6);
-  Serial.print(",");
-  Serial.print(motor2_pos, 6);
-  Serial.print(",");
-  Serial.println(atMatch ? 1 : 0);
-#else
-  Serial.print(" VSWR:");
-  Serial.print(vswr);
-  Serial.print(" LOSS:");
-  Serial.println(loss);
-#endif
+  if (csvStreamEnabled) {
+    Serial.print("VSWR_CSV,");
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(vswr, 6);
+    Serial.print(",");
+    Serial.print(lastFwdV, 6);
+    Serial.print(",");
+    Serial.print(lastRevV, 6);
+    Serial.print(",");
+    Serial.print(motor1_pos, 6);
+    Serial.print(",");
+    Serial.print(motor2_pos, 6);
+    Serial.print(",");
+    Serial.println(atMatch ? 1 : 0);
+  }
 
-  return loss; // square the loss
+  return loss;
 }
 
-void takeStep(int stepPin) {
+static void takeStep(int stepPin) {
   digitalWrite(stepPin, HIGH);
   delayMicroseconds(STEP_DELAY / 2);
   digitalWrite(stepPin, LOW);
   delayMicroseconds(STEP_DELAY / 2);
 }
 
-float readPinVoltage(int sensorPin) {
-  // Guard clause to prevent division by zero
-  if (samp_num <= 0) {
-    return 0.0f; 
-  }
-
-  float sum = 0.0;
-  // Teensy 4.1 default ADC resolution is 10-bit (0-1023) at 3.3V
-  const float mvPerStep = 3300.0f / 1023.0f;
-
-  for (int i = 0; i < samp_num; i++) {
-    // Read the voltage in mV using custom Teensy function
-    sum += analogRead(sensorPin) * mvPerStep;
-    delayMicroseconds(30);
-  }
-  
-  // Calculate Average Millivolts
-  float averageMv = sum / samp_num;
-  
-  // Convert mV to Volts
-  float voltage = averageMv / 1000.0;
-  
-  return voltage;
-}
-int round_up(float value) {
+static int round_up(float value) {
   int truncated = static_cast<int>(value);
-
-  // Casting to int truncates towards zero.
-  // If the original float is strictly greater than the truncated int,
-  // it had a positive fractional component that requires bumping up.
   if (value > truncated) {
     return truncated + 1;
   }
-
   return truncated;
 }
